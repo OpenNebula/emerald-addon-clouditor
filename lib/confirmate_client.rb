@@ -4,7 +4,7 @@
 # Sends evidence payloads to the Confirmate Evidence Store via REST API.
 # Handles authentication, retries with exponential backoff, and logging.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 require 'net/http'

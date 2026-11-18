@@ -10,7 +10,7 @@
 #   - VMImage         (from ONE Image XML)
 #   - VirtualNetwork  (from ONE Virtual Network XML)
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 require 'rexml/document'
@@ -54,7 +54,7 @@ class OntologyMapper
   # @param config [Hash] parsed YAML configuration
   def initialize(config)
     @config = config
-    @tool_id = config.dig('evidence', 'tool_id') || 'opennebula-addon-confirmate-evidence'
+    @tool_id = config.dig('evidence', 'tool_id') || 'opennebula-emerald-addon-clouditor'
     # In Confirmate the evidence field is `target_of_evaluation_id`. Accept the
     # old `cloud_service_id` key only as a transient back-compat read so an
     # operator who upgrades the addon before editing the config still gets a

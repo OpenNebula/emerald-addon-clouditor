@@ -7,7 +7,7 @@
 # server. Any RFC 6749 compatible token endpoint works.
 # Automatically refreshes tokens before expiry. Thread-safe.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 require 'net/http'

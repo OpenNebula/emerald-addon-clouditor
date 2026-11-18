@@ -11,7 +11,7 @@
 #   ARGUMENTS = "$TEMPLATE"
 #   ARGUMENTS_STDIN = "YES"
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 ONE_LOCATION = ENV['ONE_LOCATION']

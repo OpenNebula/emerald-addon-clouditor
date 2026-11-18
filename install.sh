@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# addon-confirmate-evidence - Installer
+# emerald-addon-clouditor - Installer
 # =============================================================================
 # Installs the Confirmate Evidence Collection Gateway for OpenNebula.
 # Run as root or oneadmin on the OpenNebula Front-End.
@@ -28,7 +28,7 @@ else
 fi
 
 echo "======================================"
-echo " addon-confirmate-evidence - Installer"
+echo " emerald-addon-clouditor - Installer"
 echo "======================================"
 echo ""
 echo "Hooks directory: $HOOKS_DIR"

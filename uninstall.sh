@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# addon-confirmate-evidence - Uninstaller
+# emerald-addon-clouditor - Uninstaller
 # =============================================================================
 # Removes the Confirmate Evidence Collection Gateway from OpenNebula.
 # Run as root or oneadmin on the OpenNebula Front-End.
@@ -24,7 +24,7 @@ else
 fi
 
 echo "========================================"
-echo " addon-confirmate-evidence - Uninstaller"
+echo " emerald-addon-clouditor - Uninstaller"
 echo "========================================"
 echo ""
 

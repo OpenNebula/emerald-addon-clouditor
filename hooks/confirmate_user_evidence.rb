@@ -11,7 +11,7 @@
 # TOTP secret into the user template, so enabling 2FA is an update, not a
 # creation.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 ONE_LOCATION = ENV['ONE_LOCATION']
