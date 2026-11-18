@@ -2,52 +2,19 @@
 
 ## Description
 
-This add-on collects security evidence from an [OpenNebula](https://opennebula.io)
-cloud and sends it to [Confirmate](https://github.com/confirmate/confirmate), the
-compliance engine from Fraunhofer AISEC. Confirmate checks the evidence against
-EUCS and CIS metrics, and the results appear in the EMERALD UI.
+This add-on sends security evidence from an [OpenNebula](https://opennebula.io)
+cloud to [Confirmate](https://github.com/confirmate/confirmate), the compliance
+engine of Fraunhofer AISEC. Confirmate checks the evidence against EUCS and CIS
+metrics, and the EMERALD UI shows the results.
 
-```text
-┌──────────────────────────────────────────────────────────────────────┐
-│  OpenNebula front-end                                                │
-│                                                                      │
-│  ┌───────────────────┐    ┌───────────────────────────────────────┐  │
-│  │ VMs, NICs, images │    │ this add-on                           │  │
-│  │ networks, users,  │    │                                       │  │
-│  │ datastores        │    │  hooks/   one script per resource     │  │
-│  │                   │──> │  lib/     HookCommon (shared steps)   │  │
-│  │ a change fires an │    │           OntologyMapper              │  │
-│  │ OpenNebula hook   │    │           (redacts secrets)           │  │
-│  │                   │    │           ConfirmateClient            │  │
-│  │                   │    │           TokenManager (OAuth2)       │  │
-│  └───────────────────┘    └───────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   │  POST /v1/evidence_store/evidence
-                                   │  HTTPS + OAuth2 token (Keycloak in EMERALD)
-                                   ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  Confirmate (Fraunhofer AISEC), EMERALD assessment services          │
-│                                                                      │
-│  ┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐  │
-│  │  Evidence    │     │  Assessment      │     │  Orchestrator    │  │
-│  │  Store       │ ──> │  (Rego metrics)  │ ──> │  (results)       │  │
-│  └──────────────┘     └──────────────────┘     └──────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   │  assessment results
-                                   ▼
-                       ┌────────────────────────┐
-                       │  EMERALD UI            │
-                       │  compliance dashboard  │
-                       └────────────────────────┘
-```
+How it works:
 
+1. A VM, NIC, image, network, user or datastore changes in OpenNebula.
+2. An OpenNebula hook runs the add-on on the Front-end.
+3. The add-on converts the resource to evidence and removes passwords, tokens and 2FA secrets.
+4. The add-on sends the evidence to the Confirmate Evidence Store, with an OAuth2 token.
 
-The add-on runs on the OpenNebula Front-end. OpenNebula hooks run it every time
-a VM, NIC, image, network, user or datastore changes. The add-on maps the
-resource to the Confirmate ontology, removes passwords, tokens and 2FA secrets
-from the raw XML, and posts the evidence with an OAuth2 token.
+Refer to [How It Works](docs/how-it-works.md) for the diagram and the code modules.
 
 ## Development
 
