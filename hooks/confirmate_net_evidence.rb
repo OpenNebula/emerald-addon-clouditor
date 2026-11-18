@@ -5,7 +5,7 @@
 # OpenNebula API hook triggered on one.vn.allocate calls.
 # Sends VirtualNetwork evidence to Confirmate's Evidence Store.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 ONE_LOCATION = ENV['ONE_LOCATION']

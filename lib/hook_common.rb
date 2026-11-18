@@ -6,7 +6,7 @@
 # it reads the payload, loads the configuration, creates the logger, and
 # catches every error, so that a hook never blocks an OpenNebula operation.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 ONE_LOCATION = ENV['ONE_LOCATION'] unless defined?(ONE_LOCATION)

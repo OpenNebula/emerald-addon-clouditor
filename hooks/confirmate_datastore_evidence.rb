@@ -7,7 +7,7 @@
 # Evidence Store, so the ObjectStoragePublicAccessDisabled metric can assess
 # whether a datastore is open to other users.
 #
-# Part of addon-confirmate-evidence (EMERALD project)
+# Part of emerald-addon-clouditor (EMERALD project)
 # =============================================================================
 
 ONE_LOCATION = ENV['ONE_LOCATION']
