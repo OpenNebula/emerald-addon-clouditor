@@ -1,8 +1,5 @@
 # EMERALD Evidence Add-on for OpenNebula
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![EMERALD](https://img.shields.io/badge/EU-EMERALD%20Horizon%20Europe-yellow)](https://emerald-he.eu)
-
 ## Description
 
 This add-on collects security evidence from an [OpenNebula](https://opennebula.io)
