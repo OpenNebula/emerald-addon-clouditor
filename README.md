@@ -1,22 +1,21 @@
-# addon-confirmate-evidence
+# EMERALD Evidence Add-on for OpenNebula
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![OpenNebula](https://img.shields.io/badge/OpenNebula-%E2%89%A5%206.x-brightgreen)](https://opennebula.io)
 [![EMERALD](https://img.shields.io/badge/EU-EMERALD%20Horizon%20Europe-yellow)](https://emerald-he.eu)
+
+## Description
 
 This add-on collects security evidence from an [OpenNebula](https://opennebula.io)
 cloud and sends it to [Confirmate](https://github.com/confirmate/confirmate), the
 compliance engine from Fraunhofer AISEC. Confirmate checks the evidence against
 EUCS and CIS metrics, and the results appear in the EMERALD UI.
 
-## How it works
-
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │  OpenNebula front-end                                                │
 │                                                                      │
 │  ┌───────────────────┐    ┌───────────────────────────────────────┐  │
-│  │ VMs, NICs, images │    │ addon-confirmate-evidence (this repo) │  │
+│  │ VMs, NICs, images │    │ this add-on                           │  │
 │  │ networks, users,  │    │                                       │  │
 │  │ datastores        │    │  hooks/   one script per resource     │  │
 │  │                   │──> │  lib/     HookCommon (shared steps)   │  │
@@ -47,27 +46,90 @@ EUCS and CIS metrics, and the results appear in the EMERALD UI.
                        └────────────────────────┘
 ```
 
-The add-on runs on the OpenNebula front-end. OpenNebula hooks run it every time
-a VM, NIC, image, network, user or datastore changes. The add-on maps the resource to the Confirmate ontology,
-removes passwords, tokens and 2FA secrets from the raw XML, and posts the
-evidence with an OAuth2 token.
 
-## Install
+The add-on runs on the OpenNebula Front-end. OpenNebula hooks run it every time
+a VM, NIC, image, network, user or datastore changes. The add-on maps the
+resource to the Confirmate ontology, removes passwords, tokens and 2FA secrets
+from the raw XML, and posts the evidence with an OAuth2 token.
 
-You need an OpenNebula front-end (6.x or later), the URL of a Confirmate Evidence
-Store and an OAuth2 client for it. To test without a real deployment, start a
-local Confirmate first with [docs/local-confirmate.md](docs/local-confirmate.md).
+## Development
+
+To contribute bug patches or new features, you can use the GitHub Pull Request
+model. It is assumed that code and documentation are contributed under the
+Apache License 2.0.
+
+Run the tests before you open a pull request:
 
 ```bash
-git clone https://github.com/pablodelarco/addon-confirmate-evidence
-cd addon-confirmate-evidence
+ruby tests/test_ontology_mapper.rb
+ruby tests/test_token_manager.rb
+ruby tests/test_confirmate_client.rb
+ruby tests/smoke.rb   # end-to-end POST, skipped if no Confirmate is reachable
+```
+
+## Authors
+
+* Pablo del Arco, [OpenNebula Systems](https://opennebula.io)
+
+## Compatibility
+
+* Tested with OpenNebula 7.4 on the EMERALD Pilot 4 Front-end.
+
+## Requirements
+
+### OpenNebula Front-end
+
+* Ruby from the OpenNebula packages. The add-on uses only the Ruby standard library.
+* Network access to the Confirmate Evidence Store and to the OAuth2 token endpoint.
+
+### Confirmate
+
+* The URL of a Confirmate Evidence Store.
+* An OAuth2 client for it. In an EMERALD deployment, Keycloak issues the token.
+* The ID of a Target of Evaluation (ToE) from the EMERALD UI.
+
+To test without a real deployment, start a local Confirmate first with
+[docs/local-confirmate.md](docs/local-confirmate.md).
+
+## Features
+
+| OpenNebula event | Evidence sent |
+|---|---|
+| VM enters RUNNING or POWEROFF, or is terminated | VirtualMachine, one NetworkInterface per NIC, one BlockStorage per disk |
+| NIC attached or detached | One NetworkInterface per NIC, and the VirtualMachine again |
+| Image becomes READY | VMImage |
+| Virtual network created | VirtualNetwork |
+| User created or updated | Identity |
+| Datastore created, updated or permissions changed | ObjectStorage |
+
+The evidence covers disk encryption, public IPs, SSH and RDP exposure in
+security groups, backups, log retention, MFA for administrators and public
+access to images and datastores.
+[docs/mapping.md](docs/mapping.md) lists every field and the controls it
+supports.
+
+## Limitations
+
+* Hooks react to changes. A resource that exists before the installation is sent
+  only when it changes state for the first time.
+* The add-on doesn't keep a queue. If the Evidence Store doesn't answer after
+  3 attempts, the evidence of that event is lost and the error is in the log.
+
+## Installation
+
+```bash
+git clone https://github.com/OpenNebula/emerald-addon-clouditor
+cd emerald-addon-clouditor
 sudo ./install.sh
 ```
 
 The installer copies the scripts to `/var/lib/one/remotes/hooks/`, the
 configuration to `/etc/one/confirmate-evidence.conf`, and registers 12 hooks.
 
-## Configure
+`sudo ./uninstall.sh` removes the hooks and scripts and asks before it deletes
+the configuration.
+
+## Configuration
 
 Edit `/etc/one/confirmate-evidence.conf`. In an EMERALD deployment, Keycloak
 issues the token, so ask the platform operator for a service client.
@@ -105,61 +167,31 @@ sudo chmod 640 /etc/one/confirmate-evidence.conf
 | `evidence.logrotate_path` | Logrotate file used to report log retention | `/etc/logrotate.d/opennebula` |
 | `logging.level`, `logging.file` | Add-on log | `info`, `/var/log/one/confirmate-evidence.log` |
 
-The add-on does not start if `target_of_evaluation_id` is missing or is not a
+The add-on doesn't start if `target_of_evaluation_id` is missing or is not a
 UUID.
 
-## Check that it works
+## Usage
+
+Check that the 12 hooks are registered and follow the log:
 
 ```bash
 sudo -u oneadmin onehook list | grep -c hook-confirmate   # expect 12
 sudo tail -f /var/log/one/confirmate-evidence.log
 ```
 
-Create or change any resource, for example a test virtual network. The log
+Create or change any resource, for example a test Virtual Network. The log
 shows `Evidence ... stored successfully (HTTP 200)` when the evidence reaches
 Confirmate.
 
-## What the add-on collects
-
-Hooks react to changes, so existing resources are sent the next time they
-change state.
-
-| OpenNebula event | Evidence sent |
-|---|---|
-| VM enters RUNNING or POWEROFF, or is terminated | VirtualMachine, one NetworkInterface per NIC, one BlockStorage per disk |
-| NIC attached or detached | One NetworkInterface per NIC, and the VirtualMachine again |
-| Image becomes READY | VMImage |
-| Virtual network created | VirtualNetwork |
-| User created or updated | Identity |
-| Datastore created, updated or permissions changed | ObjectStorage |
-
-The evidence covers disk encryption, public IPs, SSH and RDP exposure in
-security groups, backups, log retention, MFA for administrators and public
-access to images and datastores.
-[docs/mapping.md](docs/mapping.md) lists every field and the controls it
-supports.
-
-## Troubleshooting
+### Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
-| `HTTP 401` in the add-on log | Wrong `client_id` or `client_secret`, or `auth.enabled` does not match the server |
+| `HTTP 401` in the add-on log | Wrong `client_id` or `client_secret`, or `auth.enabled` doesn't match the server |
 | `HTTP 400` with a validation message | `target_of_evaluation_id` is not a real ToE. Copy it from the EMERALD UI |
 | Fewer than 12 hooks registered | Register the templates by hand, as shown in [docs/troubleshooting.md](docs/troubleshooting.md) |
 
 [docs/troubleshooting.md](docs/troubleshooting.md) covers the other cases.
-
-## Tests
-
-```bash
-ruby tests/test_ontology_mapper.rb
-ruby tests/test_token_manager.rb
-ruby tests/test_confirmate_client.rb
-ruby tests/smoke.rb   # end-to-end POST, skipped if no Confirmate is reachable
-```
-
-`sudo ./uninstall.sh` removes the hooks and scripts and asks before it deletes
-the configuration.
 
 ## Acknowledgments
 
