@@ -1,0 +1,194 @@
+# =============================================================================
+# ConfirmateClient - HTTP client for the Confirmate Evidence Store API
+# =============================================================================
+# Sends evidence payloads to the Confirmate Evidence Store via REST API.
+# Handles authentication, retries with exponential backoff, and logging.
+#
+# Part of addon-confirmate-evidence (EMERALD project)
+# =============================================================================
+
+require 'net/http'
+require 'openssl'
+require 'uri'
+require 'json'
+require 'digest/sha1'
+
+$LOAD_PATH.unshift(File.dirname(__FILE__)) unless $LOAD_PATH.include?(File.dirname(__FILE__))
+require 'token_manager'
+
+# HTTP client for posting evidence to the Confirmate Evidence Store.
+#
+# Uses TokenManager for automatic bearer token management and implements
+# retry logic with exponential backoff for transient failures.
+class ConfirmateClient
+  # Maximum number of retry attempts for failed requests
+  MAX_RETRIES = 3
+
+  # Base delay in seconds for exponential backoff
+  BASE_DELAY = 1
+
+  # Evidence Store REST endpoint path (unchanged between Clouditor and Confirmate)
+  EVIDENCE_PATH = '/v1/evidence_store/evidence'
+
+  # @param config [Hash] parsed YAML configuration
+  # @param logger [Logger]
+  def initialize(config, logger)
+    @config = config
+    @logger = logger
+    # Strip trailing slashes so "https://host/" doesn't yield "//v1/..." paths
+    @endpoint = (config.dig('confirmate', 'endpoint') || 'http://localhost:8080').sub(%r{/+\z}, '')
+    @ca_file = config.dig('confirmate', 'tls', 'ca_file')
+    @token_manager = TokenManager.new(config, @logger)
+
+    # A single OpenNebula installation is often assessed under more than one
+    # Target of Evaluation at once, for instance the pilot's own ToE and a
+    # second one used to try a certification scheme without disturbing it.
+    # Mirroring here rather than in the hooks means every hook gains it and
+    # none of them had to change.
+    primary = config.dig('evidence', 'target_of_evaluation_id').to_s
+    extra   = config.dig('evidence', 'additional_target_of_evaluation_ids')
+    @mirror_target_ids = Array(extra).map(&:to_s).reject(&:empty?).uniq - [primary]
+  end
+
+  # Sends an evidence payload to the Confirmate Evidence Store.
+  #
+  # @param evidence [Hash] evidence payload (as returned by OntologyMapper)
+  # @return [Hash] parsed response body on success
+  # @raise [RuntimeError] if all retries are exhausted
+  # Stores the evidence against the primary Target of Evaluation, then mirrors
+  # it to any additional ones. The primary result is what the caller gets back;
+  # a mirror that fails is logged and never raised, because losing a secondary
+  # copy must not fail the hook that produced the real one.
+  def store_evidence(evidence)
+    result = store_one(evidence)
+    @mirror_target_ids.each do |target_id|
+      begin
+        store_one(mirror_evidence(evidence, target_id))
+      rescue StandardError => e
+        @logger.warn("Mirror to Target of Evaluation #{target_id} failed: #{e.message}")
+      end
+    end
+    result
+  end
+
+  # Copies an evidence payload for another Target of Evaluation. The evidence id
+  # has to change too, since it is the primary key in the Evidence Store, so it
+  # is re-derived deterministically from the original id and the target. The
+  # same resource re-sent later therefore keeps producing stable, distinct ids.
+  def mirror_evidence(evidence, target_id)
+    copy = Marshal.load(Marshal.dump(evidence))
+    copy['targetOfEvaluationId'] = target_id
+    copy['id'] = derive_uuid("#{evidence['id']}:#{target_id}")
+    copy
+  end
+
+  def derive_uuid(name)
+    bytes = Digest::SHA1.digest(name).bytes[0, 16]
+    bytes[6] = (bytes[6] & 0x0F) | 0x50
+    bytes[8] = (bytes[8] & 0x3F) | 0x80
+    hex = bytes.map { |b| format('%02x', b) }.join
+    [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join('-')
+  end
+
+  def store_one(evidence)
+    evidence_id = evidence['id'] || 'unknown'
+    resource_type = evidence['resource']&.keys&.first || 'unknown'
+    resource_id = evidence.dig('resource', resource_type, 'id') || 'unknown'
+
+    @logger.info("Sending evidence #{evidence_id} (#{resource_type}: #{resource_id})")
+    @logger.debug("Evidence payload: #{JSON.generate(evidence)}")
+
+    attempt = 0
+    last_error = nil
+
+    while attempt < MAX_RETRIES
+      attempt += 1
+
+      begin
+        response = post_evidence(evidence)
+
+        case response
+        when Net::HTTPSuccess
+          @logger.info("Evidence #{evidence_id} stored successfully (HTTP #{response.code})")
+          # NOTE: not `return JSON.parse(...) rescue {}` — with a rescue
+          # modifier the `return` is aborted when parse raises, falling
+          # through to the retry loop and re-POSTing stored evidence.
+          body = response.body
+          return {} if body.nil? || body.strip.empty?
+
+          begin
+            return JSON.parse(body)
+          rescue JSON::ParserError
+            return {}
+          end
+        when Net::HTTPUnauthorized
+          @logger.warn("Token expired, refreshing and retrying (attempt #{attempt}/#{MAX_RETRIES})")
+          @token_manager = TokenManager.new(@config, @logger)
+        when Net::HTTPConflict
+          # 409 = deterministic-UUID dedup: this exact evidence is already
+          # stored. That is success for our purposes, not an error.
+          @logger.info("Evidence #{evidence_id} already stored (HTTP 409), skipping")
+          return {}
+        when Net::HTTPClientError
+          # Any other 4xx is deterministic (bad payload, unknown ToE, ...);
+          # retrying cannot change the outcome, so fail fast.
+          last_error = RuntimeError.new("HTTP #{response.code}: #{response.body.to_s[0, 300]}")
+          @logger.error("Evidence #{evidence_id} rejected (HTTP #{response.code}), not retrying: #{response.body}")
+          break
+        else
+          @logger.warn("HTTP #{response.code} from Evidence Store (attempt #{attempt}/#{MAX_RETRIES}): #{response.body}")
+        end
+      rescue StandardError => e
+        last_error = e
+        @logger.warn("Request failed (attempt #{attempt}/#{MAX_RETRIES}): #{e.message}")
+      end
+
+      if attempt < MAX_RETRIES
+        delay = BASE_DELAY * (2**(attempt - 1))
+        @logger.debug("Retrying in #{delay}s...")
+        sleep(delay)
+      end
+    end
+
+    error_msg = "Failed to store evidence #{evidence_id} after #{MAX_RETRIES} attempts"
+    error_msg += ": #{last_error.message}" if last_error
+    @logger.error(error_msg)
+    raise error_msg
+  end
+
+  private
+
+  # Performs the HTTP POST to the Evidence Store.
+  #
+  # @param evidence [Hash] evidence payload
+  # @return [Net::HTTPResponse]
+  def post_evidence(evidence)
+    uri = URI.parse("#{@endpoint}#{EVIDENCE_PATH}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    apply_ca_file(http)
+    http.open_timeout = 10
+    http.read_timeout = 30
+
+    request = Net::HTTP::Post.new(uri.path)
+    request['Content-Type'] = 'application/json'
+    token = @token_manager.token
+    request['Authorization'] = "Bearer #{token}" if token
+    request.body = JSON.generate(evidence)
+
+    http.request(request)
+  end
+
+  # When confirmate.tls.ca_file is configured, trust that CA bundle IN ADDITION
+  # to the host's system roots (some OpenNebula front-ends lack the CA that
+  # signed the Confirmate/Keycloak certificates). Certificate verification
+  # (VERIFY_PEER, the Net::HTTP default) is never weakened.
+  def apply_ca_file(http)
+    return unless http.use_ssl? && @ca_file && !@ca_file.empty?
+
+    store = OpenSSL::X509::Store.new
+    store.set_default_paths   # keep the host's default trust roots
+    store.add_file(@ca_file)  # plus the configured CA
+    http.cert_store = store
+  end
+end
