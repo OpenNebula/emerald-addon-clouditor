@@ -1,0 +1,880 @@
+# =============================================================================
+# OntologyMapper - Maps OpenNebula XML to Confirmate ontology JSON
+# =============================================================================
+# Transforms OpenNebula resource representations (XML from hook $TEMPLATE)
+# into Confirmate's ontology-based evidence format for the Evidence Store.
+#
+# Supported resource types (confirmate.ontology.v1):
+#   - VirtualMachine  (from ONE VM XML)
+#   - NetworkInterface (from NIC elements within VM XML)
+#   - VMImage         (from ONE Image XML)
+#   - VirtualNetwork  (from ONE Virtual Network XML)
+#
+# Part of emerald-addon-clouditor (EMERALD project)
+# =============================================================================
+
+require 'rexml/document'
+require 'time'
+require 'digest'
+require 'json'
+
+# Maps OpenNebula resource XML documents to Confirmate ontology JSON structures.
+#
+# Uses deterministic UUID v5 generation so that the same resource at the same
+# timestamp always produces the same evidence ID (idempotency).
+class OntologyMapper
+  # Mirrored defaults.
+  #
+  # The Evidence Store speaks protojson, which omits proto3 default values, so
+  # a `false` boolean and an empty list disappear from the JSON the EMERALD UI
+  # renders. `atRestEncryption.customerKeyEncryption.enabled = false` arrives
+  # as `"atRestEncryption": {"customerKeyEncryption": {}}`, and an auditor
+  # reading that panel cannot tell "OpenNebula reported not encrypted" from
+  # "OpenNebula never looked".
+  #
+  # Every such value is therefore also written into `labels`, a
+  # map<string,string> where "false" is an ordinary non-empty string and
+  # survives the round trip. The ontology fields the metrics read are left
+  # exactly as they were, so mirroring changes what the evidence shows and
+  # never what a metric decides.
+  #
+  # OpenNebula's built-in administrators group is always GID 0.
+  ADMIN_GROUP_ID = '0'
+
+  # UUID namespace for generating deterministic evidence IDs (UUID v5)
+  NAMESPACE_UUID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+
+  # All-zeros ToE: a placeholder the orchestrator rejects with
+  # "target of evaluation not found". Must never be sent.
+  PLACEHOLDER_TOE = '00000000-0000-0000-0000-000000000000'
+
+  # RFC 4122 canonical UUID shape (any version)
+  UUID_FORMAT = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+
+  # @param config [Hash] parsed YAML configuration
+  def initialize(config)
+    @config = config
+    @tool_id = config.dig('evidence', 'tool_id') || 'opennebula-addon-confirmate-evidence'
+    # In Confirmate the evidence field is `target_of_evaluation_id`. Accept the
+    # old `cloud_service_id` key only as a transient back-compat read so an
+    # operator who upgrades the addon before editing the config still gets a
+    # working install; shape changes happen in the wrap.
+    @target_of_evaluation_id = config.dig('evidence', 'target_of_evaluation_id') \
+      || config.dig('evidence', 'cloud_service_id')
+    # Coerce non-String YAML values (numbers, hashes from typos) so the guard
+    # below reports the curated message instead of a NoMethodError.
+    @target_of_evaluation_id = @target_of_evaluation_id.to_s unless @target_of_evaluation_id.nil?
+    @logrotate_path = config.dig('evidence', 'logrotate_path') || '/etc/logrotate.d/opennebula'
+
+    # Fail fast on a missing or malformed ToE: those can never be accepted by
+    # any orchestrator. Without this the addon would POST evidence that is
+    # silently rejected, and because each hook swallows errors and exits 0 the
+    # operator would never see why.
+    if @target_of_evaluation_id.nil? || @target_of_evaluation_id.empty? \
+       || !@target_of_evaluation_id.match?(UUID_FORMAT)
+      raise "evidence.target_of_evaluation_id is unset or not a UUID " \
+            "(#{@target_of_evaluation_id.inspect}). Paste the real ToE UUID " \
+            "from the EMERALD UI into confirmate-evidence.conf."
+    end
+
+    # The all-zeros UUID is the shipped placeholder. It is a *valid* ToE only
+    # against a local orchestrator started with --create-default-target-of-
+    # evaluation; against any real deployment the orchestrator rejects it. Warn
+    # loudly (stderr is captured into the hook log) so an operator who forgot to
+    # set it understands why every evidence is being rejected.
+    if @target_of_evaluation_id == PLACEHOLDER_TOE
+      warn 'confirmate-evidence: WARNING evidence.target_of_evaluation_id is the ' \
+           'all-zeros placeholder; this only works against a local default ' \
+           'orchestrator. Set the real ToE UUID for any real deployment.'
+    end
+
+    @default_region = config.dig('evidence', 'default_region') || 'eu-south-1'
+  end
+
+  # Maps a full ONE VM XML document to a VirtualMachine evidence payload.
+  #
+  # Field mapping vs confirmate.ontology.v1.VirtualMachine:
+  #   - networkInterfaceIds: array of NIC IDs (was networkInterfaces objects)
+  #   - blockStorageIds: array of disk IDs (was blockStorage objects)
+  #   - automaticUpdates: renamed from autoUpdates
+  #   - internetAccessibleEndpoint: renamed from publicIp
+  #   - atRestEncryption: removed (no longer a VM-level field in
+  #     confirmate.ontology.v1); the algorithm and enabled flag remain
+  #     available in the attached raw XML.
+  #
+  # @param xml_str [String] OpenNebula VM XML (decoded from Base64)
+  # @param sg_xml_by_id [Hash] optional {sgId => `onesecgroup show -x` XML} so
+  #   the mapper can compute SSH/RDP exposure (CIS 9.2/9.3). When empty, the
+  #   sshRestricted/rdpRestricted labels are omitted.
+  # @return [Hash] evidence payload ready for ConfirmateClient#store_evidence
+  def map_vm(xml_str, sg_xml_by_id: {})
+    doc = REXML::Document.new(xml_str)
+    vm = doc.root
+
+    vm_id = text(vm, 'ID')
+    vm_name = text(vm, 'NAME')
+    stime = text(vm, 'STIME')
+    creation_time = epoch_to_rfc3339(stime)
+
+    # Collect NIC references (IDs only — NICs are submitted as separate evidence)
+    nic_ids = collect_elements(vm, 'TEMPLATE/NIC').map do |nic|
+      "one-nic-#{vm_id}-#{text(nic, 'NIC_ID') || '0'}"
+    end
+
+    # Collect disk/block storage references (IDs only)
+    disk_ids = collect_elements(vm, 'TEMPLATE/DISK').map do |disk|
+      "one-disk-#{vm_id}-#{text(disk, 'DISK_ID') || '0'}"
+    end
+
+    # Internet-accessible if any NIC is reachable from outside (was publicIp)
+    has_public_ip = collect_elements(vm, 'TEMPLATE/NIC').any? { |nic| public_nic?(nic) }
+
+    # CXB OpenNebula custom controls (CIS). Computed booleans are emitted as
+    # labels so the custom metrics can evaluate them; the raw XML stays attached
+    # for ground-truth audit.
+    labels = {
+      'diskEncryption' => disk_encrypted?(vm).to_s,  # CIS 4.3 vmdisk_encryption
+      'publicIp' => has_public_ip.to_s,              # CIS 4.4 public_ip_adress
+      # Mirror of automaticUpdates.enabled, which protojson drops (see the
+      # "Mirrored defaults" note at the top of the class).
+      'automaticUpdatesEnabled' => 'false'
+    }
+    unless sg_xml_by_id.nil? || sg_xml_by_id.empty?
+      # Only emit the ssh/rdp labels when EVERY security group referenced by the
+      # VM's NICs was fetched and parsed. With partial coverage the missing
+      # group could contain the very rule that exposes the port, so claiming
+      # "restricted" would be a false compliance statement; omitting the labels
+      # is the honest answer (same as when no SG data is supplied at all).
+      expected = nic_security_group_ids(vm)
+      parsed = expected.map { |id| [id, parse_inbound_rules(sg_xml_by_id[id])] }.to_h
+      if !expected.empty? && parsed.values.none?(&:nil?)
+        inbound = parsed.values.flatten
+        labels['sshRestricted'] = (!port_open_from_internet?(inbound, 22)).to_s    # CIS 9.2
+        labels['rdpRestricted'] = (!port_open_from_internet?(inbound, 3389)).to_s  # CIS 9.3
+      else
+        warn "confirmate-evidence: security groups #{expected - parsed.reject { |_, v| v.nil? }.keys} " \
+             'could not be read; omitting sshRestricted/rdpRestricted labels for ' \
+             "one-vm-#{vm_id} rather than risking a false compliance claim"
+      end
+    end
+
+    resource = {
+      'virtualMachine' => {
+        'id' => "one-vm-#{vm_id}",
+        'name' => vm_name,
+        'creationTime' => creation_time,
+        'geoLocation' => { 'region' => @default_region },
+        'networkInterfaceIds' => nic_ids,
+        'blockStorageIds' => disk_ids,
+        'bootLogging' => logging_feature(vm),
+        'osLogging' => logging_feature(vm),
+        'automaticUpdates' => { 'enabled' => false },
+        'internetAccessibleEndpoint' => has_public_ip,
+        'labels' => labels
+      }
+    }
+
+    wrap_evidence("vm-#{vm_id}", resource, xml_str)
+  end
+
+  # Returns the unique Security Group IDs referenced by a VM's NICs. The VM hook
+  # uses this to know which security groups to fetch (`onesecgroup show -x`) and
+  # pass back via map_vm's sg_xml_by_id, so SSH/RDP exposure can be computed.
+  #
+  # @param vm_xml_str [String] OpenNebula VM XML
+  # @return [Array<String>] unique SG id strings
+  def self.security_group_ids(vm_xml_str)
+    doc = REXML::Document.new(vm_xml_str)
+    ids = []
+    doc.root.each_element('TEMPLATE/NIC') do |nic|
+      sg = nic.elements['SECURITY_GROUPS']&.text
+      next if sg.nil? || sg.empty?
+
+      sg.split(',').each { |s| ids << s.strip }
+    end
+    ids.reject(&:empty?).uniq
+  rescue StandardError
+    []
+  end
+
+  # Best-effort fetch of the security groups referenced by a VM's NICs, shared
+  # by the VM and NIC hooks so both submit identical sshRestricted/rdpRestricted
+  # labels. SG ids are coerced to Integer before shelling out (no injection).
+  # Any failure simply yields a smaller map; map_vm's coverage check then omits
+  # the ssh/rdp labels instead of claiming false compliance.
+  #
+  # @param vm_xml_str [String] OpenNebula VM XML
+  # @return [Hash] { sgId => `onesecgroup show -x` XML }
+  def self.fetch_sg_xml_by_id(vm_xml_str)
+    sg_xml_by_id = {}
+    security_group_ids(vm_xml_str).each do |sgid|
+      out = `onesecgroup show #{sgid.to_i} -x 2>/dev/null`
+      sg_xml_by_id[sgid] = out if out && !out.strip.empty?
+    end
+    sg_xml_by_id
+  rescue StandardError
+    sg_xml_by_id || {}
+  end
+
+  # Maps NIC elements from a VM XML to NetworkInterface evidence payloads.
+  #
+  # confirmate.ontology.v1.NetworkInterface has no first-class fields for IP
+  # address or security group membership; both are emitted as labels (a
+  # map<string,string>) so they remain queryable. The boolean
+  # `internetAccessibleEndpoint` replaces the previous publicIp/EXTERNAL check.
+  #
+  # @param xml_str [String] OpenNebula VM XML (decoded from Base64)
+  # @return [Array<Hash>] list of evidence payloads, one per NIC
+  # @param xml_str [String] OpenNebula VM XML (decoded from Base64)
+  # @param sg_xml_by_id [Hash] optional {sgId => `onesecgroup show -x` XML}.
+  #   When the rules of EVERY security group of a NIC are readable, the NIC
+  #   carries `accessRestriction.l3Firewall` with `restrictedPorts` — the field
+  #   the EMERALD `RestrictSSH` metric evaluates (`== "22"`). Omitted on
+  #   partial/no coverage (same integrity rule as the VM ssh/rdp labels).
+  def map_nics(xml_str, sg_xml_by_id: {})
+    doc = REXML::Document.new(xml_str)
+    vm = doc.root
+
+    vm_id = text(vm, 'ID')
+    nics = collect_elements(vm, 'TEMPLATE/NIC')
+
+    nics.map do |nic|
+      nic_id = text(nic, 'NIC_ID') || '0'
+      ip = text(nic, 'IP') || ''
+      network_name = text(nic, 'NETWORK') || ''
+      sg_ids = text(nic, 'SECURITY_GROUPS') || ''
+
+      labels = {}
+      labels['ip'] = ip unless ip.empty?
+      labels['network'] = network_name unless network_name.empty?
+      labels['securityGroupIds'] = sg_ids unless sg_ids.empty?
+
+      internet_accessible = public_nic?(nic)
+      labels['internetAccessibleEndpoint'] = internet_accessible.to_s
+
+      nic_resource = {
+        'id' => "one-nic-#{vm_id}-#{nic_id}",
+        'name' => "#{network_name}/nic#{nic_id}",
+        'labels' => labels,
+        'internetAccessibleEndpoint' => internet_accessible
+      }
+
+      restriction = nic_access_restriction(sg_ids, sg_xml_by_id)
+      if restriction
+        nic_resource['accessRestriction'] = restriction
+        mirror_l3_firewall(labels, restriction['l3Firewall'])
+      end
+
+      wrap_evidence("nic-#{vm_id}-#{nic_id}", { 'networkInterface' => nic_resource }, xml_str)
+    end
+  end
+
+  # Maps an ONE Image XML document to a VMImage evidence payload.
+  #
+  # @param xml_str [String] OpenNebula Image XML (decoded from Base64)
+  # @return [Hash] evidence payload
+  def map_image(xml_str)
+    doc = REXML::Document.new(xml_str)
+    img = doc.root
+
+    img_id = text(img, 'ID')
+    img_name = text(img, 'NAME')
+    regtime = text(img, 'REGTIME')
+    creation_time = epoch_to_rfc3339(regtime)
+
+    # OpenNebula marks an image usable by other users via PERMISSIONS/OTHER_U.
+    # confirmate.ontology.v1.VMImage has no `publicAccess` field (that lives on
+    # FileStorage/ObjectStorage), so emit it as a label: queryable, and never an
+    # unknown field the Evidence Store could reject.
+    permissions = img.elements['PERMISSIONS']
+    public_access = permissions ? (text(permissions, 'OTHER_U') == '1') : false
+
+    resource = {
+      'vmImage' => {
+        'id' => "one-image-#{img_id}",
+        'name' => img_name,
+        'creationTime' => creation_time,
+        'labels' => { 'publicAccess' => public_access.to_s }
+      }
+    }
+
+    wrap_evidence("image-#{img_id}", resource, xml_str)
+  end
+
+  # Maps an ONE Virtual Network XML document to a VirtualNetwork evidence payload.
+  #
+  # @param xml_str [String] OpenNebula VNet XML (decoded from Base64)
+  # @return [Hash] evidence payload
+  def map_network(xml_str)
+    doc = REXML::Document.new(xml_str)
+    vnet = doc.root
+
+    vnet_id = text(vnet, 'ID')
+    vnet_name = text(vnet, 'NAME')
+
+    resource = {
+      'virtualNetwork' => {
+        'id' => "one-vnet-#{vnet_id}",
+        'name' => vnet_name,
+        'geoLocation' => {
+          'region' => @default_region
+        }
+      }
+    }
+
+    wrap_evidence("vnet-#{vnet_id}", resource, xml_str)
+  end
+
+  # Maps an ONE user XML document to an Identity evidence payload.
+  #
+  # confirmate.ontology.v1.Identity carries `privileged`, `enforceMfa` and
+  # `activated` as first-class booleans, which is exactly what the
+  # `AdminMFAEnabled` metric evaluates. OpenNebula can answer all three:
+  #
+  #   privileged  <- membership of the built-in oneadmin group (GID 0)
+  #   enforceMfa  <- TEMPLATE/FIREEDGE/TWO_FACTOR_AUTH_SECRET, written by
+  #                  FireEdge only once the user actually enrols a second
+  #                  factor, so its presence is a real signal rather than a
+  #                  self-declared tag
+  #   activated   <- ENABLED
+  #
+  # AUTH_DRIVER goes out as a label because the ontology has no field for it.
+  # It is the authoritative answer to "is this account federated with the
+  # corporate directory" (`core` is local, `ldap`/`x509`/`saml` are not), which
+  # control AIM-02 asks for.
+  #
+  # Service accounts are skipped. `server_cipher` is OpenNebula's internal
+  # driver for the serveradmin account that OneFlow, OneGate and Sunstone
+  # authenticate with. It sits in the oneadmin group and will never enrol a
+  # second factor, so emitting it would report a human administrator without
+  # MFA that does not exist.
+  #
+  # @param xml_str [String] OpenNebula user XML (as `oneuser show -x`)
+  # @return [Hash, nil] evidence payload, or nil for a service account
+  def map_identity(xml_str)
+    doc = REXML::Document.new(xml_str)
+    user = doc.root
+
+    auth_driver = (text(user, 'AUTH_DRIVER') || '').strip
+    return nil if auth_driver == 'server_cipher'
+
+    user_id = text(user, 'ID')
+    name    = text(user, 'NAME')
+
+    group_ids = collect_elements(user, 'GROUPS/ID').map { |g| g.text.to_s.strip }
+    group_ids << text(user, 'GID').to_s.strip if group_ids.empty?
+    privileged = group_ids.include?(ADMIN_GROUP_ID)
+
+    secret = text(user, 'TEMPLATE/FIREEDGE/TWO_FACTOR_AUTH_SECRET').to_s.strip
+    enforce_mfa = !secret.empty?
+    activated = text(user, 'ENABLED').to_s.strip == '1'
+
+    labels = { 'authDriver' => auth_driver }
+    labels['federated'] = (!auth_driver.empty? && auth_driver != 'core').to_s
+    labels['groupIds'] = group_ids.join(',') unless group_ids.empty?
+    # Mirrors of activated, privileged and enforceMfa. The last one is what
+    # AdminMFAEnabled reads, and false is exactly the case an auditor asks about.
+    labels['activated'] = activated.to_s
+    labels['privileged'] = privileged.to_s
+    labels['enforceMfa'] = enforce_mfa.to_s
+
+    resource = {
+      'identity' => {
+        'id' => "one-user-#{user_id}",
+        'name' => name,
+        'activated' => activated,
+        'privileged' => privileged,
+        'enforceMfa' => enforce_mfa,
+        'labels' => labels
+      }
+    }
+
+    wrap_evidence("user-#{user_id}", resource, xml_str)
+  end
+
+  # Maps the disks of a VM to BlockStorage evidence payloads, one per disk.
+  #
+  # map_vm already emits `blockStorageIds` naming these resources; without the
+  # resources themselves Confirmate cannot resolve the VM's `related` array,
+  # and `VirtualMachineDiskEncryptionEnabled` (CIS 4.3) never evaluates.
+  #
+  # The metric reads `atRestEncryption.customerKeyEncryption.enabled`, matching
+  # the control's wording about customer-supplied keys. OpenNebula's disk
+  # ENCRYPTION attribute is LUKS with an operator-provided secret, so it maps
+  # there rather than to managedKeyEncryption.
+  #
+  # @param xml_str [String] OpenNebula VM XML (decoded from Base64)
+  # @return [Array<Hash>] one evidence payload per disk
+  def map_block_storages(xml_str)
+    doc = REXML::Document.new(xml_str)
+    vm = doc.root
+
+    vm_id = text(vm, 'ID')
+
+    # OpenNebula backs up a whole VM, not a datastore, but the ontology hangs
+    # `backups` off the storage messages and never off VirtualMachine. The disk
+    # is the thing actually copied, so the VM's backup state is reported on each
+    # of its BlockStorage resources.
+    backups_enabled = vm_backups_enabled?(vm)
+
+    collect_elements(vm, 'TEMPLATE/DISK').map do |disk|
+      disk_id = text(disk, 'DISK_ID') || '0'
+      raw = (text(disk, 'ENCRYPTION') || text(disk, 'ENCRYPT') || '').strip
+      encrypted = !raw.empty? && !%w[no none 0 false].include?(raw.downcase)
+
+      labels = {}
+      labels['encryption'] = raw unless raw.empty?
+      image = text(disk, 'IMAGE')
+      labels['image'] = image if image
+      # Mirrors of atRestEncryption.customerKeyEncryption.enabled and
+      # backups[0].enabled, both dropped by protojson when false.
+      labels['atRestEncryptionEnabled'] = encrypted.to_s
+      labels['backupEnabled'] = backups_enabled.to_s
+
+      resource = {
+        'blockStorage' => {
+          'id' => "one-disk-#{vm_id}-#{disk_id}",
+          'name' => image || "disk#{disk_id}",
+          'parentId' => "one-vm-#{vm_id}",
+          'geoLocation' => { 'region' => @default_region },
+          'atRestEncryption' => {
+            'customerKeyEncryption' => { 'enabled' => encrypted }
+          },
+          'backups' => [{ 'enabled' => backups_enabled }],
+          'labels' => labels
+        }
+      }
+
+      wrap_evidence("disk-#{vm_id}-#{disk_id}", resource, xml_str)
+    end
+  end
+
+  # Maps an ONE Datastore XML document to an ObjectStorage evidence payload.
+  #
+  # `publicAccess` reads the OTHER_U permission bit, which is what makes a
+  # datastore readable by every user in the installation. OTHER_M and OTHER_A
+  # are carried as labels rather than folded into the flag, because the metric
+  # `ObjectStoragePublicAccessDisabled` asks only whether the storage is
+  # publicly accessible.
+  #
+  # @param xml_str [String] OpenNebula datastore XML (as `onedatastore show -x`)
+  # @return [Hash] evidence payload
+  def map_datastore(xml_str)
+    doc = REXML::Document.new(xml_str)
+    ds  = doc.root
+
+    ds_id = text(ds, 'ID')
+    name  = text(ds, 'NAME')
+
+    other_u = text(ds, 'PERMISSIONS/OTHER_U').to_s.strip
+    public_access = other_u == '1'
+
+    labels = {}
+    { 'OTHER_M' => 'otherManage', 'OTHER_A' => 'otherAdmin' }.each do |bit, key|
+      value = text(ds, "PERMISSIONS/#{bit}").to_s.strip
+      labels[key] = value unless value.empty?
+    end
+    ds_type = text(ds, 'TYPE').to_s.strip
+    labels['datastoreType'] = ds_type unless ds_type.empty?
+    # Mirror of publicAccess, dropped by protojson on the compliant (false) case.
+    labels['publicAccess'] = public_access.to_s
+
+    resource = {
+      'objectStorage' => {
+        'id' => "one-datastore-#{ds_id}",
+        'name' => name || "datastore#{ds_id}",
+        'geoLocation' => { 'region' => @default_region },
+        'publicAccess' => public_access,
+        'labels' => labels
+      }
+    }
+
+    wrap_evidence("datastore-#{ds_id}", resource, xml_str)
+  end
+
+  private
+
+  # True only when the VM has at least one completed backup (`BACKUP_IDS`).
+  # A populated `BACKUP_CONFIG` with no backup ever run does not count: a
+  # policy that never executed protects nothing, so it reports false, the
+  # strict reading agreed with CaixaBank for the pilot. An empty `<BACKUPS>`
+  # block is likewise a real non-compliance rather than missing evidence.
+  #
+  # @param vm [REXML::Element] the VM root element
+  # @return [Boolean]
+  def vm_backups_enabled?(vm)
+    ids = REXML::XPath.first(vm, 'BACKUPS/BACKUP_IDS')
+    !ids.nil? && ids.elements.to_a.any?
+  end
+
+
+  # Wraps a mapped ontology resource into a complete Confirmate Evidence payload.
+  #
+  # On-the-wire shape (matches the StoreEvidence REST body annotation
+  # `body: "evidence"` in evidence_store.proto:30-35):
+  #
+  #   {
+  #     "id": "<uuid>",
+  #     "timestamp": "<RFC3339>",
+  #     "targetOfEvaluationId": "<uuid>",
+  #     "toolId": "<string>",
+  #     "resource": { "<lowerCamelOntologyType>": { ..., "raw": "<xml>" } }
+  #   }
+  #
+  # In Confirmate, `raw` lives on each ontology message (e.g.
+  # VirtualMachine.raw at proto field 14073), not on the Evidence itself.
+  #
+  # @param resource_key [String] unique key for deterministic UUID generation
+  # @param resource [Hash] ontology resource object keyed by lowerCamel type
+  # @param raw_xml [String, nil] original XML payload, attached to the resource
+  # @return [Hash] complete Evidence payload (to be POSTed as the HTTP body)
+  # Element and attribute names whose value must never leave the front-end,
+  # such as the password hash, TOKEN_PASSWORD, the 2FA secret, login tokens
+  # and any PASSWORD in a VM CONTEXT.
+  SECRET_NAME = /PASSWORD|PASSWD|SECRET|TOKEN/i.freeze
+
+  # Walks the parsed XML, so nesting, attributes and CDATA cannot hide a
+  # secret. If the XML does not parse, no raw XML is attached at all.
+  def redact_secrets(xml)
+    doc = REXML::Document.new(xml)
+    doc.each_recursive do |el|
+      el.attributes.each_attribute do |attr|
+        attr.element.attributes[attr.expanded_name] = '[REDACTED]' if attr.name =~ SECRET_NAME
+      end
+      next unless el.name =~ SECRET_NAME
+
+      el.children.to_a.each(&:remove)
+      el.add_text('[REDACTED]')
+    end
+    out = +''
+    doc.write(out)
+    out
+  rescue REXML::ParseException
+    '[raw XML omitted because it could not be parsed for redaction]'
+  end
+
+  def wrap_evidence(resource_key, resource, raw_xml)
+    timestamp = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    evidence_id = generate_uuid(resource_key, timestamp)
+
+    if raw_xml
+      type_key = resource.keys.first
+      clean = redact_secrets(raw_xml)
+      truncated = clean.length > 10_000 ? clean[0..9999] : clean
+      resource[type_key]['raw'] = truncated
+    end
+
+    {
+      'id' => evidence_id,
+      'timestamp' => timestamp,
+      'targetOfEvaluationId' => @target_of_evaluation_id,
+      'toolId' => @tool_id,
+      'resource' => resource
+    }
+  end
+
+  # Generates a deterministic UUID v5 (RFC 4122 §4.3) from a resource key and
+  # timestamp. Ensures idempotency: same resource + same second = same evidence
+  # ID, on every host. Implemented with stdlib SHA1 only — Digest::UUID is an
+  # ActiveSupport extension absent from stock Ruby, and depending on it made
+  # the generated IDs differ between hosts with and without it.
+  #
+  # @param resource_key [String] e.g., "vm-42"
+  # @param timestamp [String] RFC 3339 timestamp
+  # @return [String] UUID v5 string
+  def generate_uuid(resource_key, timestamp)
+    name = "#{resource_key}:#{timestamp}"
+    ns_bytes = [NAMESPACE_UUID.delete('-')].pack('H*')
+    bytes = Digest::SHA1.digest(ns_bytes + name).bytes[0, 16]
+    bytes[6] = (bytes[6] & 0x0F) | 0x50 # version 5
+    bytes[8] = (bytes[8] & 0x3F) | 0x80 # RFC 4122 variant
+    hex = bytes.map { |b| format('%02x', b) }.join
+    [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join('-')
+  end
+
+  # Checks if a NIC has a public (non-RFC1918) IP address.
+  #
+  # @param nic [REXML::Element] NIC element
+  # @return [Boolean] true if NIC has a public IP
+  def public_nic?(nic)
+    return true if text(nic, 'EXTERNAL')&.upcase == 'YES'
+
+    # A global-unicast IPv6 address is internet-reachable by definition
+    # (OpenNebula exposes it separately from link-local/ULA addresses).
+    ip6_global = text(nic, 'IP6_GLOBAL')
+    return true if ip6_global && !ip6_global.empty?
+
+    ip = text(nic, 'IP')
+    return false if ip.nil? || ip.empty?
+
+    !private_ip?(ip)
+  end
+
+  # Determines whether an IP address is in RFC 1918 private ranges.
+  #
+  # @param ip [String] IPv4 address
+  # @return [Boolean] true if private
+  def private_ip?(ip)
+    octets = ip.split('.').map(&:to_i)
+    return true if octets.length != 4
+
+    # 10.0.0.0/8
+    return true if octets[0] == 10
+    # 172.16.0.0/12
+    return true if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31
+    # 192.168.0.0/16
+    return true if octets[0] == 192 && octets[1] == 168
+    # Loopback
+    return true if octets[0] == 127
+
+    false
+  end
+
+  # Checks if VM has logging enabled (heuristic based on template attributes).
+  #
+  # @param vm [REXML::Element] VM root element
+  # @return [Boolean]
+  # Logging feature hash for boot/os logging. `retentionPeriod` is a Go-style
+  # duration string because the OSLoggingRetention metric parses it with
+  # time.parse_duration_ns; it is omitted when the frontend's logrotate policy
+  # cannot be read, never guessed.
+  def logging_feature(vm)
+    feature = { 'enabled' => logging_enabled?(vm) }
+    retention = log_retention_duration
+    feature['retentionPeriod'] = retention if retention
+    feature
+  end
+
+  # Reads the frontend's logrotate policy for the OpenNebula logs and returns
+  # the retention as protojson Duration seconds ("31449600s" = 52 weekly
+  # rotations); google.protobuf.Duration rejects any other unit. logrotate keeps
+  # `rotate N` archives at `daily`/`weekly`/`monthly` cadence, so retention is
+  # N * cadence. Returns nil when the file is missing or has no rotate count.
+  def log_retention_duration
+    return nil unless File.readable?(@logrotate_path)
+
+    conf = File.read(@logrotate_path)
+    rotate = conf[/^\s*rotate\s+(\d+)/, 1]
+    return nil if rotate.nil?
+
+    days_per_cycle = if conf =~ /^\s*daily\b/ then 1
+                     elsif conf =~ /^\s*monthly\b/ then 30
+                     else 7 # logrotate's default cadence block here is weekly
+                     end
+    "#{rotate.to_i * days_per_cycle * 24 * 3600}s"
+  rescue StandardError
+    nil
+  end
+
+  def logging_enabled?(vm)
+    # Check for LOG section in USER_TEMPLATE or TEMPLATE
+    log_elem = vm.elements['USER_TEMPLATE/LOG'] || vm.elements['TEMPLATE/LOG']
+    return true if log_elem
+
+    # Check for monitoring enabled
+    monitoring = vm.elements['MONITORING']
+    return true if monitoring && monitoring.elements.size > 0
+
+    false
+  end
+
+  # Converts an OpenNebula epoch timestamp (seconds since 1970 as a string)
+  # to an RFC 3339 UTC datetime. Returns nil on missing/zero/invalid input.
+  #
+  # @param epoch_str [String, nil] e.g. "1709013200"
+  # @return [String, nil] RFC 3339 timestamp or nil
+  def epoch_to_rfc3339(epoch_str)
+    return nil if epoch_str.nil? || epoch_str.empty?
+
+    secs = epoch_str.to_i
+    return nil if secs <= 0
+
+    Time.at(secs).utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+  end
+
+  # Extracts text content from an XML element by XPath.
+  #
+  # @param element [REXML::Element] parent element
+  # @param xpath [String] XPath expression
+  # @return [String, nil] text content or nil
+  def text(element, xpath)
+    el = element.elements[xpath]
+    el&.text
+  end
+
+  # Collects all matching elements (handles single element or array in ONE XML).
+  # OpenNebula XML may have a single <NIC> or multiple <NIC> elements.
+  #
+  # @param element [REXML::Element] parent element
+  # @param xpath [String] XPath to match
+  # @return [Array<REXML::Element>] list of matching elements
+  def collect_elements(element, xpath)
+    results = []
+    element.each_element(xpath) { |el| results << el }
+    results
+  end
+
+  # Unique Security Group IDs referenced by this VM's NICs.
+  def nic_security_group_ids(vm)
+    ids = []
+    collect_elements(vm, 'TEMPLATE/NIC').each do |nic|
+      sg = text(nic, 'SECURITY_GROUPS')
+      next if sg.nil? || sg.empty?
+
+      sg.split(',').each { |s| ids << s.strip }
+    end
+    ids.reject(&:empty?).uniq
+  end
+
+  # True if the VM has at least one disk and every disk is encrypted (CIS 4.3).
+  # The exact OpenNebula attribute can vary by setup; a non-empty, non-negative
+  # ENCRYPTION (or ENCRYPT) value counts as encrypted. The raw XML is attached
+  # so an assessor can verify the ground truth regardless.
+  def disk_encrypted?(vm)
+    disks = collect_elements(vm, 'TEMPLATE/DISK')
+    return false if disks.empty?
+
+    disks.all? do |d|
+      v = (text(d, 'ENCRYPTION') || text(d, 'ENCRYPT') || '').strip.downcase
+      !v.empty? && !%w[no none 0 false].include?(v)
+    end
+  end
+
+  # Builds the NetworkInterface `accessRestriction.l3Firewall` object from the
+  # NIC's security groups, or nil when the rules are unknown (no SGs listed, no
+  # SG data supplied, or any referenced group unreadable — never guess).
+  #
+  # `restrictedPorts` is scoped to SSH for now: the EMERALD `RestrictSSH`
+  # metric checks strict equality `restrictedPorts == "22"`, so emitting a
+  # broader list (e.g. "22,3389") would fail a genuinely compliant NIC. The
+  # RDP state stays available in the VM's `labels.rdpRestricted`.
+  def nic_access_restriction(sg_ids_csv, sg_xml_by_id)
+    ids = sg_ids_csv.to_s.split(',').map(&:strip).reject(&:empty?)
+
+    # A NIC with no security group at all has no firewall, which is the worst
+    # case, not a case that does not apply. Report it as enabled=false so the
+    # metric fails it honestly instead of skipping the interface.
+    if ids.empty?
+      return { 'l3Firewall' => { 'enabled' => false, 'restrictedPorts' => [] } }
+    end
+
+    # The NIC does have security groups but we could not read them: unknown,
+    # omit the field rather than claim a firewall state we have not seen.
+    return nil if sg_xml_by_id.nil? || sg_xml_by_id.empty?
+
+    parsed = ids.map { |id| parse_inbound_rules(sg_xml_by_id[id]) }
+    return nil if parsed.any?(&:nil?) # partial coverage -> unknown, omit
+
+    inbound = parsed.flatten
+    ports = []
+    ports << '22'   unless port_open_from_internet?(inbound, 22)
+    ports << '3389' unless port_open_from_internet?(inbound, 3389)
+    {
+      'l3Firewall' => {
+        'enabled' => true,
+        'restrictedPorts' => ports,
+        'allowedSources' => management_sources(inbound)
+      }
+    }
+  end
+
+  # Mirrors an l3Firewall block into the NIC's labels so the values a firewall
+  # metric reads stay readable in the UI. `enabled` disappears when false, and
+  # `restrictedPorts`/`allowedSources` disappear when empty, which is precisely
+  # the non-compliant case an auditor stops on. An empty list is written as
+  # "none" rather than "" so it reads as a measured result.
+  #
+  # @param labels [Hash] the NIC's label map, modified in place
+  # @param l3 [Hash, nil] the l3Firewall block just built
+  # @return [void]
+  def mirror_l3_firewall(labels, l3)
+    return unless l3
+
+    labels['l3FirewallEnabled'] = l3['enabled'].to_s
+    %w[restrictedPorts allowedSources].each do |key|
+      list = l3[key]
+      next if list.nil?
+
+      labels[key] = list.empty? ? 'none' : list.join(',')
+    end
+  end
+
+  # Source descriptor of one inbound rule. An OpenNebula rule scopes its source
+  # by IP (+SIZE, a count of addresses) or by NETWORK_ID; a rule with neither
+  # accepts traffic from anywhere.
+  def rule_source(rule)
+    net = text(rule, 'NETWORK_ID').to_s
+    return "vnet:#{net}" unless net.empty?
+
+    ip = text(rule, 'IP').to_s
+    return '0.0.0.0/0' if ip.empty?
+
+    size = text(rule, 'SIZE').to_s
+    size.empty? ? ip : "#{ip}/#{size}"
+  end
+
+  # Sources allowed to reach the management ports (SSH 22, RDP 3389), for the
+  # `allowedSources` ontology field. Scoped to those ports on purpose: the CXB
+  # bastion metrics ask who can reach SSH/RDP, and a single firewall-level list
+  # mixing web traffic sources in would fail compliant NICs.
+  def management_sources(rules)
+    rules.select { |r| %w[ALL TCP].include?(r['protocol']) }
+         .select { |r| range_includes?(r['range'], 22) || range_includes?(r['range'], 3389) }
+         .map { |r| r['source'] }
+         .uniq.sort
+  end
+
+  # Parses the INBOUND rules from an `onesecgroup show -x` XML string into a list
+  # of {protocol, range, restricted_source} hashes.
+  #
+  # Returns nil (NOT []) when the XML is missing or unparseable, so map_vm can
+  # distinguish "this SG genuinely has no inbound rules" (=> most restrictive,
+  # []) from "we could not read this SG" (=> unknown, labels must be omitted).
+  def parse_inbound_rules(sg_xml)
+    return nil if sg_xml.nil? || sg_xml.strip.empty?
+
+    doc = REXML::Document.new(sg_xml)
+    rules = []
+    REXML::XPath.each(doc, '//RULE') do |r|
+      next unless (text(r, 'RULE_TYPE') || '').upcase == 'INBOUND'
+
+      restricted = !(text(r, 'NETWORK_ID').to_s.empty? && text(r, 'IP').to_s.empty?)
+      rules << {
+        'protocol' => (text(r, 'PROTOCOL') || 'ALL').upcase,
+        'range' => text(r, 'RANGE'),
+        'restricted_source' => restricted,
+        'source' => rule_source(r)
+      }
+    end
+    rules
+  rescue StandardError
+    nil
+  end
+
+  # True if any inbound rule exposes `port` to an unrestricted source (internet):
+  # protocol ALL or TCP, the port within RANGE (empty RANGE = all ports), and no
+  # source network/IP restriction.
+  def port_open_from_internet?(rules, port)
+    rules.any? do |r|
+      next false if r['restricted_source']
+      next false unless %w[ALL TCP].include?(r['protocol'])
+
+      range_includes?(r['range'], port)
+    end
+  end
+
+  # OpenNebula RANGE is e.g. "22", "22,53,80", "1000:2000", or empty (all ports).
+  def range_includes?(range, port)
+    return true if range.nil? || range.strip.empty?
+
+    range.split(',').any? do |part|
+      part = part.strip
+      if part.include?(':')
+        lo, hi = part.split(':', 2).map(&:to_i)
+        port >= lo && port <= hi
+      else
+        part.to_i == port
+      end
+    end
+  end
+end

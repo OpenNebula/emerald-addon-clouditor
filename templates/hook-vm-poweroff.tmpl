@@ -1,0 +1,9 @@
+NAME      = "hook-confirmate-vm-poweroff"
+TYPE      = state
+COMMAND   = "confirmate_vm_evidence.rb"
+ARGUMENTS = "$TEMPLATE"
+ARGUMENTS_STDIN = "YES"
+ON        = CUSTOM
+RESOURCE  = VM
+STATE     = POWEROFF
+LCM_STATE = LCM_INIT
