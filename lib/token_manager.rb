@@ -18,11 +18,10 @@ require 'monitor'
 
 # Manages bearer tokens for authenticating with the Confirmate API.
 #
-# Three modes:
+# Two modes:
 #   1. Disabled (auth.enabled = false)         -> #token returns nil; the
 #      ConfirmateClient must skip the Authorization header.
-#   2. Static token (auth.static_token = "..") -> returned verbatim.
-#   3. Dynamic OAuth 2.0 client_credentials    -> POST to auth.token_url
+#   2. OAuth 2.0 client_credentials            -> POST to auth.token_url
 #      with HTTP Basic (client_id:client_secret); reads access_token and
 #      expires_in from the standard OAuth2 response.
 #
@@ -50,7 +49,6 @@ class TokenManager
     @token_url = auth['token_url']
     @client_id = auth['client_id']
     @client_secret = auth['client_secret']
-    @static_token = auth['static_token']
     @ca_file = config.dig('confirmate', 'tls', 'ca_file')
   end
 
@@ -63,7 +61,6 @@ class TokenManager
   def token
     synchronize do
       return nil unless @enabled
-      return @static_token if @static_token && !@static_token.empty?
 
       refresh_token if @token.nil? || token_expired?
       @token

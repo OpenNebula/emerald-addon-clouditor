@@ -32,38 +32,6 @@ class TestTokenManager < Minitest::Test
     assert_nil tm.token
   end
 
-  # --- Static token mode ---
-
-  def test_static_token
-    config = {
-      'confirmate' => {
-        'auth' => {
-          'enabled' => true,
-          'static_token' => 'test-static-token-12345'
-        }
-      }
-    }
-    tm = TokenManager.new(config, @logger)
-    assert_equal 'test-static-token-12345', tm.token
-  end
-
-  def test_static_token_preferred_over_dynamic
-    config = {
-      'confirmate' => {
-        'auth' => {
-          'enabled' => true,
-          'token_url' => 'http://localhost:8080/v1/auth/token',
-          'client_id' => 'confirmate',
-          'client_secret' => 'confirmate',
-          'static_token' => 'static-wins'
-        }
-      }
-    }
-    tm = TokenManager.new(config, @logger)
-    # Static token should be returned without any HTTP call
-    assert_equal 'static-wins', tm.token
-  end
-
   # --- Dynamic OAuth2 client_credentials mode ---
 
   def test_missing_credentials_raises
@@ -77,14 +45,12 @@ class TestTokenManager < Minitest::Test
     assert_match(/missing auth configuration/, err.message)
   end
 
-  def test_empty_static_token_triggers_dynamic
-    # static_token = "" should not short-circuit; fall through to OAuth flow.
-    # Using a deliberately unreachable port to assert the dynamic path runs.
+  def test_unreachable_token_url_raises
+    # A deliberately unreachable port asserts that the OAuth request runs and fails loudly.
     config = {
       'confirmate' => {
         'auth' => {
           'enabled' => true,
-          'static_token' => '',
           'token_url' => 'http://127.0.0.1:1/v1/auth/token',
           'client_id' => 'confirmate',
           'client_secret' => 'confirmate'

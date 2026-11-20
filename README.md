@@ -122,7 +122,6 @@ sudo chmod 640 /etc/one/confirmate-evidence.conf
 | `confirmate.auth.enabled` | Send a bearer token | `false` |
 | `confirmate.auth.token_url` | OAuth2 token endpoint | `http://localhost:8080/v1/auth/token` |
 | `confirmate.auth.client_id`, `client_secret` | OAuth2 client | `confirmate`, `confirmate` |
-| `confirmate.auth.static_token` | Fixed bearer token instead of OAuth2 (testing) | empty |
 | `confirmate.tls.ca_file` | Extra CA bundle, added to the system roots | empty |
 | `evidence.target_of_evaluation_id` | ToE UUID (required) | all-zeros placeholder |
 | `evidence.additional_target_of_evaluation_ids` | Other ToEs that receive a copy of every evidence | empty |
